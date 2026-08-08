@@ -1,0 +1,26 @@
+[project]
+name = "solo-empire-data-lake"
+version = "0.1.0"
+description = "Portable lake-first landing, Bronze Parquet, lineage, and DuckDB runtime."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+bronze = ["pyarrow>=14.0.0,<24.0.0"]
+query = ["duckdb>=1.1.0,<2.0.0"]
+lake = [
+  "pyarrow>=14.0.0,<24.0.0",
+  "duckdb>=1.1.0,<2.0.0",
+]
+iceberg = [
+  "pyarrow>=14.0.0,<24.0.0",
+  "duckdb>=1.1.0,<2.0.0",
+  "pyiceberg[sql-sqlite,s3fs]>=0.8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
