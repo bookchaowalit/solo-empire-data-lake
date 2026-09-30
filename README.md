@@ -47,9 +47,15 @@ default Bronze API path.
 ## Verification
 
 ```bash
+ruff check src tests
 python -m unittest discover -s tests -v
 python -m compileall -q src
 ```
+
+`tests/test_standalone_parity.py` pins the module surface that the
+`book-*-data` product repositories import (`product_adapter`,
+`product_store`, `silver`, `storage`) and runs it with no parent Solo Empire
+checkout on disk.
 
 The package is intentionally small enough for a solo local machine while
 remaining installable by public product repositories and hosted containers.
