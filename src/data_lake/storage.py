@@ -83,6 +83,19 @@ class ObjectStore:
 
     def __init__(self, uri: str):
         self.uri = uri
+        if (
+            os.name == "nt"
+            and len(uri) >= 3
+            and uri[0].isalpha()
+            and uri[1] == ":"
+            and uri[2] in {"\\", "/"}
+        ):
+            # A Windows drive path such as C:\lake parses as URI scheme "c".
+            self.root = Path(uri).expanduser().resolve()
+            self.bucket = None
+            self.prefix = ""
+            self.scheme = "file"
+            return
         parsed = urlparse(uri)
         scheme = parsed.scheme.lower()
         if not scheme:
@@ -96,6 +109,15 @@ class ObjectStore:
             path = unquote(parsed.path)
             if parsed.netloc and parsed.netloc not in {"", "localhost"}:
                 path = f"/{parsed.netloc}{path}"
+            elif (
+                os.name == "nt"
+                and len(path) >= 3
+                and path[0] == "/"
+                and path[1].isalpha()
+                and path[2] == ":"
+            ):
+                # file:///C:/lake -> C:/lake, not the drive-relative C:lake.
+                path = path[1:]
             self.root = Path(path or ".").expanduser().resolve()
             self.bucket = None
             self.prefix = ""

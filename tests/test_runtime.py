@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -49,7 +51,7 @@ class RuntimeTests(unittest.TestCase):
             raw = b'{"id":"job-1","title":"Data Engineer"}'
             result = ingest_payload(
                 raw,
-                [{"id": "job-1", "title": "Data Engineer", "event_time": "2026-08-08T00:00:00Z"}],
+                [{"id": "job-1", "title": "Data Engineer", "event_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}],
                 source="book-job-data",
                 domain="jobs",
                 dataset="job_postings",
@@ -103,6 +105,15 @@ class RuntimeTests(unittest.TestCase):
             read_bronze_rows(contract, "job_postings", data_lake_uri="s3://bucket/prefix")
         self.assertIn("ingest_date=*/source=*/part-*.parquet", str(captured["paths"]))
 
+
+    @unittest.skipUnless(os.name == "nt", "Windows drive paths only")
+    def test_windows_drive_paths_resolve_to_absolute_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            for uri in (str(root), root.as_posix(), root.as_uri()):
+                store = ObjectStore(uri)
+                self.assertEqual(store.scheme, "file")
+                self.assertEqual(store.root, root)
 
 if __name__ == "__main__":
     unittest.main()
