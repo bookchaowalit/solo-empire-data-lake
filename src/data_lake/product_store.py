@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import os
 from datetime import datetime, timezone
@@ -597,11 +598,13 @@ def load_csv_projection(
             "retrieved_at": utc_now_iso(),
         }
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
         if not text.strip():
             rows: list[dict[str, str]] = []
         else:
-            rows = [dict(row) for row in csv.DictReader(text.splitlines())]
+            # Not text.splitlines(): it also splits on U+2028/U+2029/NEL/FF,
+            # which csv.writer leaves unquoted, so one cell became two rows.
+            rows = [dict(row) for row in csv.DictReader(io.StringIO(text, newline=""))]
     except Exception as exc:  # noqa: BLE001
         return {
             "items": [],
@@ -674,8 +677,11 @@ def get_record_from_payload(
     record_id: str,
     payload: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
-    record_id = unquote(record_id)
-    for item in payload.get("items") or []:
-        if item.get("record_id") == record_id:
-            return item
+    # The HTTP handlers already percent-decode the path, so try the id as
+    # given first; decoding it again made ids containing "%" unreachable.
+    items = payload.get("items") or []
+    for candidate in dict.fromkeys((record_id, unquote(record_id))):
+        for item in items:
+            if item.get("record_id") == candidate:
+                return item
     return None

@@ -43,3 +43,23 @@ and the Iceberg read path has offline tests; S3 write paths are still untested.
 - `tests/test_iceberg_read.py`: offline tests for `read_iceberg_rows`
   (config guard, `metadata_location` forwarding, error mapping).
 - CI/README lint `scripts/` too; README documents the parity check.
+
+## Done in this pass (pass 3: edge cases)
+
+- `ingest._read_payload`: NDJSON was split with `str.splitlines()`, so a JSON
+  string holding a raw U+2028/U+2029/NEL (legal, and what
+  `json.dumps(ensure_ascii=False)` emits) broke the line into invalid JSON; it
+  now splits on CR/LF only. JSON/NDJSON/CSV inputs are decoded as `utf-8-sig`:
+  a BOM made JSON unparseable and renamed the first CSV column to `﻿id`,
+  silently dropping every `source_record_id`.
+- `product_store.load_csv_projection`: same `splitlines()` bug turned one CSV
+  cell containing U+2028 (left unquoted by `csv.writer`) into two rows; BOM
+  header handled too.
+- `product_store.get_record_from_payload`: the product APIs already
+  percent-decode the path, and this decoded again, so ids containing `%`
+  were unreachable; it now tries the id as given before the decoded form.
+- The three functions are allow-listed in `scripts/check_parity.py`.
+  P1: port the same fixes to the parent `infra/scripts/data_lake` copy and
+  drop the allow-list entries; bump the pinned lake SHA in book-*-data.
+- Verified: `tests/test_input_edge_cases.py` (7 of 8 fail on the old code);
+  full suite with `PYTHONPATH=src` and live parity; ruff 0.15.8 + 0.16.9.

@@ -58,6 +58,15 @@ ALLOWED_DIVERGENCE: dict[tuple[str, str], str] = {
     ("product_adapter", "_committed_bronze_keys"): (
         "loop variable renamed to avoid shadowing dataclasses.field"
     ),
+    ("ingest", "_read_payload"): (
+        "edge-case fix (BOM, U+2028 in NDJSON); port to the parent copy"
+    ),
+    ("product_store", "load_csv_projection"): (
+        "edge-case fix (BOM, U+2028 split rows); port to the parent copy"
+    ),
+    ("product_store", "get_record_from_payload"): (
+        "edge-case fix (no double percent-decoding); port to the parent copy"
+    ),
 }
 
 
