@@ -34,11 +34,11 @@ if __package__ in {None, ""}:
         ParquetUnavailable,
         write_bronze_parquet,
     )
-    from data_lake.storage import ObjectStore, StorageError  # type: ignore
+    from data_lake.storage import ObjectNotFound, ObjectStore, StorageError  # type: ignore
     from data_lake.iceberg import IcebergUnavailable  # type: ignore
 else:
     from .parquet import BRONZE_COLUMNS, ParquetUnavailable, write_bronze_parquet
-    from .storage import ObjectStore, StorageError
+    from .storage import ObjectNotFound, ObjectStore, StorageError
     from .iceberg import IcebergUnavailable
 
 
@@ -65,6 +65,38 @@ def slug(value: str) -> str:
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _batch_id(
+    raw_sha256: str,
+    *,
+    source: str,
+    domain: str,
+    dataset: str,
+    schema_version: str,
+    metadata: dict[str, Any],
+) -> str:
+    """Return an idempotent batch identity without cross-provider collisions.
+
+    Older batches used the raw checksum alone. Keep that identity when no
+    provider is declared, and for provider-tagged batches use the complete
+    product/provider identity so two source adapters returning identical bytes
+    can coexist under one product boundary.
+    """
+    provider = metadata.get("provider")
+    if not provider:
+        return raw_sha256[:24]
+    identity = canonical_json(
+        {
+            "raw_sha256": raw_sha256,
+            "source": source,
+            "domain": domain,
+            "dataset": dataset,
+            "schema_version": schema_version,
+            "provider": str(provider),
+        }
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
 def utc_now() -> str:
@@ -179,20 +211,99 @@ def _ingest_payload(
     domain = slug(domain_name)
     dataset = slug(dataset_name)
     schema_version = slug(schema_version_name)
-    batch_id = raw_sha256[:24]
-    extension = input_format or "bin"
-    manifest_key = f"control/manifests/source={source}/batch_id={batch_id}.json"
     metadata = metadata or {}
+    legacy_batch_id = raw_sha256[:24]
+    batch_id = _batch_id(
+        raw_sha256,
+        source=source,
+        domain=domain,
+        dataset=dataset,
+        schema_version=schema_version,
+        metadata=metadata,
+    )
+    extension = input_format or "bin"
+    content_type = content_type_override or {
+        "json": "application/json",
+        "jsonl": "application/x-ndjson",
+        "csv": "text/csv",
+        "html": "text/html",
+        "htm": "text/html",
+        "bin": "application/octet-stream",
+        "binary": "application/octet-stream",
+    }.get(extension, "application/octet-stream")
+    manifest_key = f"control/manifests/source={source}/batch_id={batch_id}.json"
 
     store = ObjectStore(data_lake_uri)
     existing_manifest: dict[str, Any] | None = None
+    existing_manifest_bytes: bytes | None = None
+
+    def read_manifest(key: str) -> tuple[dict[str, Any] | None, bytes | None]:
+        try:
+            body = store.get_bytes(key)
+        except ObjectNotFound:
+            return None, None
+        try:
+            return json.loads(body.decode("utf-8")), body
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StorageError(f"Batch manifest is invalid: {key}") from exc
+
+    existing_manifest, existing_manifest_bytes = read_manifest(manifest_key)
+    if existing_manifest is None and batch_id != legacy_batch_id:
+        # Preserve idempotency for provider-tagged batches written before the
+        # provider-aware identity was introduced, but never reuse a legacy
+        # manifest belonging to a different provider/source adapter.
+        legacy_key = f"control/manifests/source={source}/batch_id={legacy_batch_id}.json"
+        legacy_manifest, legacy_bytes = read_manifest(legacy_key)
+        if legacy_manifest is not None:
+            compatible = all(
+                legacy_manifest.get(field) == value
+                for field, value in {
+                    "source": source,
+                    "domain": domain,
+                    "dataset": dataset,
+                    "schema_version": schema_version,
+                    "metadata": metadata,
+                }.items()
+            )
+            compatible = compatible and legacy_manifest.get("raw", {}).get("sha256") == raw_sha256
+            if compatible:
+                batch_id = legacy_batch_id
+                manifest_key = legacy_key
+                existing_manifest = legacy_manifest
+                existing_manifest_bytes = legacy_bytes
+
+    checkpoint_key = f"control/checkpoints/source={source}/batch_id={batch_id}.json"
+    checkpoint: dict[str, Any] | None = None
     try:
-        existing_manifest = json.loads(store.get_bytes(manifest_key).decode("utf-8"))
-    except StorageError:
-        # A missing manifest is the normal first-ingest path. Partial runs are
-        # safe to resume because the individual object writes are immutable and
-        # idempotent.
-        existing_manifest = None
+        checkpoint_bytes = store.get_bytes(checkpoint_key)
+    except ObjectNotFound:
+        # A missing manifest/checkpoint is the normal first-ingest path. Partial
+        # runs are resumed from the immutable checkpoint written before parts.
+        checkpoint = None
+    else:
+        try:
+            checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StorageError(f"Batch {batch_id} has an invalid ingest checkpoint") from exc
+        if not isinstance(checkpoint, dict):
+            raise StorageError(f"Batch {batch_id} has an invalid ingest checkpoint shape")
+        if existing_manifest is None:
+            expected_checkpoint = {
+                "source": source,
+                "domain": domain,
+                "dataset": dataset,
+                "schema_version": schema_version,
+                "raw_sha256": raw_sha256,
+                "privacy_class": privacy_class,
+                "retention_class": retention_class,
+                "metadata": metadata,
+            }
+            for field, value in expected_checkpoint.items():
+                if checkpoint.get(field) != value:
+                    raise StorageError(f"Batch {batch_id} checkpoint does not match {field}")
+            for field in ("received_at", "run_id", "raw_key", "bronze_key"):
+                if not isinstance(checkpoint.get(field), str) or not checkpoint[field]:
+                    raise StorageError(f"Batch {batch_id} checkpoint is missing {field}")
 
     if existing_manifest is not None:
         expected = {
@@ -223,34 +334,70 @@ def _ingest_payload(
         run_id = str(existing_manifest["run_id"])
         raw_key = str(stored_raw["key"])
         bronze_key = str(existing_manifest["bronze"]["key"])
-    else:
-        received_at = utc_now()
-        received_date = received_at[:10]
-        run_id = f"{received_date}-{batch_id}"
-        # Optional multi-provider partition keeps raw bytes separated before merge.
-        provider_part = ""
-        if isinstance(metadata, dict) and metadata.get("provider"):
-            try:
-                provider_part = f"/provider={slug(str(metadata['provider']))}"
-            except ValueError:
-                provider_part = ""
-        raw_key = (
-            f"landing/source={source}{provider_part}/batch_id={batch_id}/payload.{extension}"
-        )
-        bronze_key = (
-            f"bronze/domain={domain}/dataset={dataset}/schema_version={schema_version}/"
-            f"ingest_date={received_date}/source={source}/part-{batch_id}.parquet"
-        )
 
-    content_type = content_type_override or {
-        "json": "application/json",
-        "jsonl": "application/x-ndjson",
-        "csv": "text/csv",
-        "html": "text/html",
-        "htm": "text/html",
-        "bin": "application/octet-stream",
-        "binary": "application/octet-stream",
-    }.get(extension, "application/octet-stream")
+        # A committed manifest freezes the normalized Bronze representation.
+        # Some adapters derive a row event timestamp at capture time when the
+        # provider payload has no timestamp of its own.  Re-normalizing the
+        # same raw bytes on retry would then produce different Parquet bytes
+        # and incorrectly turn an idempotent replay into an immutable conflict.
+        # Reuse the committed objects after checking their integrity instead
+        # of regenerating Bronze from a potentially time-dependent projection.
+        raw_result = store.put_bytes(raw_key, raw, content_type=content_type)
+        try:
+            stored_bronze = store.get_bytes(bronze_key)
+        except ObjectNotFound as exc:
+            raise StorageError(
+                f"Batch {batch_id} manifest exists but Bronze object is missing: {bronze_key}"
+            ) from exc
+        expected_bronze_sha = existing_manifest.get("bronze", {}).get("sha256")
+        bronze_sha = hashlib.sha256(stored_bronze).hexdigest()
+        if not isinstance(expected_bronze_sha, str) or bronze_sha != expected_bronze_sha:
+            raise StorageError(f"Batch {batch_id} manifest Bronze checksum does not match its object")
+        return {
+            "status": "success",
+            "data_lake": store.describe(),
+            "run_id": run_id,
+            "record_count": existing_manifest.get("record_count", 0),
+            "raw_key": raw_key,
+            "bronze_key": bronze_key,
+            "manifest_key": manifest_key,
+            "raw_existed": raw_result.existed,
+            "bronze_existed": True,
+            "manifest_existed": True,
+            "checkpoint_key": checkpoint_key,
+            "checkpoint_existed": checkpoint is not None,
+            "iceberg": None,
+        }
+    else:
+        if checkpoint is not None:
+            received_at = str(checkpoint["received_at"])
+            run_id = str(checkpoint["run_id"])
+            raw_key = str(checkpoint["raw_key"])
+            bronze_key = str(checkpoint["bronze_key"])
+        else:
+            received_at = utc_now()
+            received_date = received_at[:10]
+            run_id = f"{received_date}-{batch_id}"
+            # Optional multi-provider partition keeps raw bytes separated before merge.
+            provider_part = ""
+            if isinstance(metadata, dict) and metadata.get("provider"):
+                try:
+                    provider_part = f"/provider={slug(str(metadata['provider']))}"
+                except ValueError:
+                    provider_part = ""
+            raw_key = (
+                f"landing/source={source}{provider_part}/batch_id={batch_id}/payload.{extension}"
+            )
+            bronze_key = (
+                f"bronze/domain={domain}/dataset={dataset}/schema_version={schema_version}/"
+                f"ingest_date={received_date}/source={source}/part-{batch_id}.parquet"
+            )
+
+    if checkpoint is not None:
+        if checkpoint.get("input_format") != extension:
+            raise StorageError(f"Batch {batch_id} checkpoint does not match input format")
+        if checkpoint.get("content_type") != content_type:
+            raise StorageError(f"Batch {batch_id} checkpoint does not match content type")
     # ``html`` stores exact browser/source bytes in landing while still writing
     # structured Bronze rows (payload_json) for DuckDB API consumers.
     raw_input = extension in {"bin", "binary"}
@@ -285,6 +432,34 @@ def _ingest_payload(
         write_bronze_parquet(records, parquet_path)
         parquet_bytes = parquet_path.read_bytes()
 
+    checkpoint_result = None
+    if existing_manifest is None and checkpoint is None:
+        checkpoint_payload = {
+            "checkpoint_version": "1",
+            "source": source,
+            "domain": domain,
+            "dataset": dataset,
+            "schema_version": schema_version,
+            "raw_sha256": raw_sha256,
+            "privacy_class": privacy_class,
+            "retention_class": retention_class,
+            "metadata": metadata,
+            "input_format": extension,
+            "content_type": content_type,
+            "received_at": received_at,
+            "run_id": run_id,
+            "raw_key": raw_key,
+            "bronze_key": bronze_key,
+        }
+        # The checkpoint fixes all values that affect the Parquet bytes.  A
+        # later retry can therefore resume after a raw/Bronze/manifest outage
+        # without producing a conflicting part under the same immutable key.
+        checkpoint_result = store.put_bytes(
+            checkpoint_key,
+            (canonical_json(checkpoint_payload) + "\n").encode("utf-8"),
+            content_type="application/json",
+        )
+
     raw_result = store.put_bytes(raw_key, raw, content_type=content_type)
     bronze_result = store.put_bytes(bronze_key, parquet_bytes, content_type="application/vnd.apache.parquet")
     iceberg_result: dict[str, Any] | None = None
@@ -300,36 +475,52 @@ def _ingest_payload(
             warehouse_uri=iceberg_warehouse_uri,
             run_id=run_id,
         )
-    manifest = {
-        "manifest_version": "1",
-        "batch_id": batch_id,
-        "run_id": run_id,
-        "source": source,
-        "domain": domain,
-        "dataset": dataset,
-        "schema_version": schema_version,
-        "received_at": received_at,
-        "record_count": len(records),
-        "raw": {"key": raw_key, "sha256": raw_sha256, "bytes": len(raw)},
-        "bronze": {
-            "key": bronze_key,
-            "sha256": bronze_result.sha256,
-            "bytes": len(parquet_bytes),
-            "columns": list(BRONZE_COLUMNS),
-        },
-        "privacy_class": privacy_class,
-        "retention_class": retention_class,
-        "metadata": metadata,
-    }
-    if iceberg_result:
-        manifest["iceberg"] = {
-            key: value for key, value in iceberg_result.items() if key != "status"
+    if existing_manifest_bytes is not None:
+        # Batch manifests are immutable audit evidence.  A later idempotent
+        # retry may observe a newer Iceberg snapshot after another batch was
+        # appended, so never regenerate this object's snapshot metadata.
+        manifest_result = store.put_bytes(
+            manifest_key,
+            existing_manifest_bytes,
+            content_type="application/json",
+        )
+    else:
+        manifest = {
+            "manifest_version": "1",
+            "batch_id": batch_id,
+            "run_id": run_id,
+            "source": source,
+            "domain": domain,
+            "dataset": dataset,
+            "schema_version": schema_version,
+            "received_at": received_at,
+            "record_count": len(records),
+            "raw": {"key": raw_key, "sha256": raw_sha256, "bytes": len(raw)},
+            "bronze": {
+                "key": bronze_key,
+                "sha256": bronze_result.sha256,
+                "bytes": len(parquet_bytes),
+                "columns": list(BRONZE_COLUMNS),
+            },
+            "privacy_class": privacy_class,
+            "retention_class": retention_class,
+            "metadata": metadata,
         }
-    manifest_result = store.put_bytes(
-        manifest_key,
-        (canonical_json(manifest) + "\n").encode("utf-8"),
-        content_type="application/json",
-    )
+        if iceberg_result:
+            manifest["iceberg"] = {
+                # ``metadata_location`` is a catalog pointer, not immutable
+                # batch lineage. Keep it in the in-process result for exact
+                # reads, but do not persist a mutable catalog pointer.
+                key: value
+                for key, value in iceberg_result.items()
+                if key not in {"status", "metadata_location"}
+            }
+        manifest["checkpoint_key"] = checkpoint_key
+        manifest_result = store.put_bytes(
+            manifest_key,
+            (canonical_json(manifest) + "\n").encode("utf-8"),
+            content_type="application/json",
+        )
     return {
         "status": "success",
         "data_lake": store.describe(),
@@ -341,6 +532,10 @@ def _ingest_payload(
         "raw_existed": raw_result.existed,
         "bronze_existed": bronze_result.existed,
         "manifest_existed": manifest_result.existed,
+        "checkpoint_key": checkpoint_key,
+        "checkpoint_existed": bool(
+            checkpoint_result.existed if checkpoint_result is not None else checkpoint is not None
+        ),
         "iceberg": iceberg_result,
     }
 

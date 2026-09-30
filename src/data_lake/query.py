@@ -147,13 +147,26 @@ def query_parquet(
         connection.close()
 
 
-def query_iceberg(table_location: str, sql: str, parameters: list[Any] | None = None) -> list[dict[str, Any]]:
-    """Expose one Iceberg table as ``lake_table`` and execute a read query."""
+def query_iceberg(
+    table_location: str,
+    sql: str,
+    parameters: list[Any] | None = None,
+    *,
+    metadata_location: str | None = None,
+) -> list[dict[str, Any]]:
+    """Expose one Iceberg table as ``lake_table`` and execute a read query.
+
+    When a catalog has resolved the current metadata file, callers should pass
+    it explicitly.  The directory form remains supported for compatibility,
+    but relies on DuckDB's version guessing and is not safe across catalog
+    restores or multiple writers.
+    """
     connection = _connection(enable_iceberg=True)
     try:
+        scan_target = metadata_location or table_location
         connection.execute(
             "CREATE VIEW lake_table AS SELECT * FROM iceberg_scan("
-            + _sql_string_literal(table_location)
+            + _sql_string_literal(scan_target)
             + ")",
         )
         cursor = connection.execute(sql, parameters or [])
@@ -162,12 +175,18 @@ def query_iceberg(table_location: str, sql: str, parameters: list[Any] | None = 
         connection.close()
 
 
-def read_ingest_run(table_location: str, run_id: str) -> list[dict[str, Any]]:
+def read_ingest_run(
+    table_location: str,
+    run_id: str,
+    *,
+    metadata_location: str | None = None,
+) -> list[dict[str, Any]]:
     """Read only the rows belonging to one idempotent lake ingest run."""
     return query_iceberg(
         table_location,
         "SELECT * FROM lake_table WHERE ingest_run_id = ? ORDER BY event_id",
         [run_id],
+        metadata_location=metadata_location,
     )
 
 

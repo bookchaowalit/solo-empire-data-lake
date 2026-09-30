@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 from urllib.parse import unquote, urlparse
 
+from .storage import ObjectNotFound, ObjectStore, StorageError
+
 
 class LakeUnavailable(RuntimeError):
     """Raised when the Solo Empire data-lake runtime cannot be loaded."""
@@ -227,6 +229,69 @@ def list_bronze_parquet_files(
     return sorted(path for path in base.rglob("*.parquet") if path.is_file())
 
 
+def _committed_bronze_keys(
+    contract: LakeProductContract,
+    dataset: str,
+    *,
+    data_lake_uri: str,
+) -> set[str]:
+    """Return Bronze parts referenced by a complete ingest manifest.
+
+    A Parquet part can exist after a worker crashes before its manifest is
+    written.  Treating the final manifest as the lake commit marker prevents
+    readers from serving those partial batches.
+    """
+    store = ObjectStore(data_lake_uri)
+    manifest_prefixes = (
+        f"control/manifests/source={contract.source}",
+        f"control/manifests/stream-parquet/source={contract.source}",
+    )
+    expected_prefix = (
+        f"bronze/domain={contract.domain}/dataset={dataset}/"
+        f"schema_version={contract.bronze_schema_version}/"
+    )
+    committed: set[str] = set()
+    manifest_keys: list[str] = []
+    for manifest_prefix in manifest_prefixes:
+        try:
+            manifest_keys.extend(store.list_keys(manifest_prefix))
+        except StorageError as exc:
+            raise LakeIngestError(f"Cannot list Bronze commit manifests for {dataset}") from exc
+    for manifest_key in manifest_keys:
+        if not manifest_key.endswith(".json"):
+            continue
+        try:
+            body = store.get_bytes(manifest_key)
+            manifest = json.loads(body.decode("utf-8"))
+        except ObjectNotFound:
+            # A concurrent cleanup or eventually consistent listing is not a
+            # commit; simply leave this batch out of the read set.
+            continue
+        except (StorageError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LakeIngestError(f"Invalid Bronze commit manifest for {dataset}") from exc
+        if not isinstance(manifest, dict):
+            raise LakeIngestError(f"Invalid Bronze commit manifest shape for {dataset}")
+        for field, expected in {
+            "source": contract.source,
+            "domain": contract.domain,
+            "schema_version": contract.bronze_schema_version,
+        }.items():
+            if manifest.get(field) != expected:
+                raise LakeIngestError(
+                    f"Bronze commit manifest identity does not match {dataset}: {field}"
+                )
+        # A source commonly owns more than one dataset (for example prices
+        # and history).  Ignore its valid manifests for the other datasets;
+        # only the requested dataset contributes committed parts.
+        if manifest.get("dataset") != dataset:
+            continue
+        bronze = manifest.get("bronze")
+        key = bronze.get("key") if isinstance(bronze, dict) else None
+        if isinstance(key, str) and key.startswith(expected_prefix) and key.endswith(".parquet"):
+            committed.add(key)
+    return committed
+
+
 def ingest_to_lake(
     contract: LakeProductContract,
     *,
@@ -342,6 +407,7 @@ def read_bronze_rows(
     *,
     data_lake_uri: Optional[str] = None,
     sql: str | None = None,
+    require_committed: bool = True,
 ) -> list[dict[str, Any]]:
     uri = data_lake_uri or default_data_lake_uri(
         data_lake_uri=contract.data_lake_uri,
@@ -349,12 +415,26 @@ def read_bronze_rows(
         solo_empire_root=contract.solo_empire_root,
     )
     remote = is_remote_lake_uri(uri)
+    committed_keys = (
+        _committed_bronze_keys(contract, dataset, data_lake_uri=uri)
+        if require_committed
+        else None
+    )
     if remote:
-        paths: str | list[str] = remote_bronze_dataset_glob(
-            contract, dataset, data_lake_uri=uri
-        )
+        if committed_keys is not None:
+            paths = [f"{uri.rstrip('/')}/{key}" for key in sorted(committed_keys)]
+            if not paths:
+                return []
+        else:
+            paths = remote_bronze_dataset_glob(contract, dataset, data_lake_uri=uri)
     else:
         files = list_bronze_parquet_files(contract, dataset, data_lake_uri=uri)
+        if committed_keys is not None:
+            lake_root = resolve_lake_root(uri)
+            files = [
+                path for path in files
+                if path.relative_to(lake_root).as_posix() in committed_keys
+            ]
         if not files:
             return []
         paths = [str(path) for path in files]
@@ -366,7 +446,8 @@ def read_bronze_rows(
     statement = sql or (
         "SELECT event_id, source, source_record_id, domain, dataset, "
         "schema_version, received_at, event_time, payload_json, "
-        "metadata_json, ingest_run_id, raw_object_key "
+        "metadata_json, ingest_run_id, raw_object_key, raw_sha256, "
+        "privacy_class, retention_class "
         "FROM lake_table "
         "ORDER BY event_time NULLS LAST, received_at NULLS LAST, event_id"
     )
@@ -426,7 +507,11 @@ def read_iceberg_rows(
             domain=contract.domain,
             dataset=dataset,
         )
-        return query_iceberg(resolved["table_location"], statement)
+        return query_iceberg(
+            resolved["table_location"],
+            statement,
+            metadata_location=resolved.get("metadata_location"),
+        )
     except (IcebergUnavailable, DuckDBUnavailable, StorageError) as exc:
         raise LakeUnavailable(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -449,6 +534,21 @@ def parse_payload_json(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def select_latest_bronze_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    def temporal_rank(value: Any) -> tuple[int, float, str]:
+        """Compare ISO timestamps by instant, including mixed UTC offsets."""
+        raw = str(value or "").strip()
+        if not raw:
+            return (0, float("-inf"), "")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return (1, parsed.astimezone(timezone.utc).timestamp(), "")
+        except (TypeError, ValueError, OverflowError):
+            # Invalid source timestamps sort after no timestamp only by their
+            # deterministic raw value; quality gates can still quarantine them.
+            return (0, float("-inf"), raw)
+
     best: dict[str, dict[str, Any]] = {}
     for row in rows:
         key = str(row.get("source_record_id") or "").strip()
@@ -462,13 +562,13 @@ def select_latest_bronze_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, 
             best[key] = row
             continue
         prev_rank = (
-            str(previous.get("event_time") or ""),
-            str(previous.get("received_at") or ""),
+            temporal_rank(previous.get("event_time")),
+            temporal_rank(previous.get("received_at")),
             str(previous.get("event_id") or ""),
         )
         cur_rank = (
-            str(row.get("event_time") or ""),
-            str(row.get("received_at") or ""),
+            temporal_rank(row.get("event_time")),
+            temporal_rank(row.get("received_at")),
             str(row.get("event_id") or ""),
         )
         if cur_rank >= prev_rank:
@@ -478,7 +578,10 @@ def select_latest_bronze_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, 
 
 def landing_object_bytes(data_lake_uri: str, raw_key: str) -> bytes:
     """Replay exact landing bytes for a raw_object_key (offline proof)."""
-    from .storage import ObjectStore, StorageError
+    ingest_payload, ParquetUnavailable, StorageError, solo_root = load_ingest_runtime()
+    del ingest_payload, ParquetUnavailable  # import side-effect only
+    _ensure_data_lake_on_path(solo_root)
+    from .storage import ObjectStore
 
     try:
         return ObjectStore(data_lake_uri).get_bytes(raw_key)

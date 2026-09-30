@@ -58,3 +58,4 @@ def write_bronze_parquet(records: list[dict[str, Any]], destination: Path) -> No
     table = pa.Table.from_arrays(arrays, schema=schema)
     destination.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, destination, compression="zstd", version="2.6")
+

@@ -22,6 +22,10 @@ class StorageError(RuntimeError):
     """Raised when an object cannot be read or written safely."""
 
 
+class ObjectNotFound(StorageError):
+    """Raised when an object is absent (as opposed to a provider failure)."""
+
+
 class StorageConflict(StorageError):
     """Raised when an immutable local object key already contains other data."""
 
@@ -90,12 +94,12 @@ class ObjectStore:
             and uri[1] == ":"
             and uri[2] in {"\\", "/"}
         ):
-            # A Windows drive path such as C:\lake parses as URI scheme "c".
             self.root = Path(uri).expanduser().resolve()
             self.bucket = None
             self.prefix = ""
             self.scheme = "file"
             return
+
         parsed = urlparse(uri)
         scheme = parsed.scheme.lower()
         if not scheme:
@@ -116,7 +120,6 @@ class ObjectStore:
                 and path[1].isalpha()
                 and path[2] == ":"
             ):
-                # file:///C:/lake -> C:/lake, not the drive-relative C:lake.
                 path = path[1:]
             self.root = Path(path or ".").expanduser().resolve()
             self.bucket = None
@@ -180,7 +183,21 @@ class ObjectStore:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            temporary.replace(destination)
+            try:
+                # ``link`` is an atomic create-if-absent operation on the same
+                # filesystem.  Unlike replace/rename it cannot clobber a part
+                # written concurrently by another worker.
+                os.link(temporary, destination)
+            except FileExistsError:
+                existing = hashlib.sha256(destination.read_bytes()).hexdigest()
+                if existing != digest:
+                    raise StorageConflict(f"Immutable object conflict at {key}")
+                return PutResult(key=key, existed=True, sha256=digest)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
             return PutResult(key=key, existed=False, sha256=digest)
 
         assert self.bucket is not None
@@ -196,29 +213,81 @@ class ObjectStore:
                     "DATA_LAKE_CLOUD_WRITE_ENABLED=true only for an intentional "
                     "R2/S3 run"
                 )
-        full_key = self._full_key(key)
-        head = self._run_aws([
-            "s3api", "head-object", "--bucket", self.bucket, "--key", full_key,
-            *self._aws_args(),
-        ])
-        if head.returncode == 0:
-            return PutResult(key=key, existed=True, sha256=digest)
-
-        if remote_cloud:
+            # Reject oversized cloud payloads before any provider call. This
+            # keeps the safety budget deterministic and makes the guard truly
+            # network-free when a caller hands us an object that is too large.
             max_bytes = _cloud_max_object_bytes()
             if max_bytes and len(data) > max_bytes:
                 raise StorageError(
                     f"Cloud object exceeds DATA_LAKE_CLOUD_MAX_OBJECT_BYTES "
                     f"({len(data)} > {max_bytes})"
                 )
+        full_key = self._full_key(key)
+        head = self._run_aws([
+            "s3api", "head-object", "--bucket", self.bucket, "--key", full_key,
+            *self._aws_args(),
+        ])
+        if head.returncode == 0:
+            # Custom metadata is written with every upload.  Older objects may
+            # not have it, so fall back to a byte-for-byte read rather than
+            # treating mere existence as proof that an immutable key matches.
+            try:
+                payload = json.loads(head.stdout.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise StorageError(f"Object metadata returned invalid JSON for {key}") from exc
+            metadata = payload.get("Metadata") if isinstance(payload, dict) else None
+            stored_digest = None
+            if isinstance(metadata, dict):
+                for name, value in metadata.items():
+                    if str(name).lower() == "sha256":
+                        stored_digest = str(value).lower()
+                        break
+            if stored_digest:
+                if stored_digest != digest:
+                    raise StorageConflict(f"Immutable object conflict at {key}")
+                return PutResult(key=key, existed=True, sha256=digest)
+            try:
+                existing_digest = hashlib.sha256(self.get_bytes(key)).hexdigest()
+            except ObjectNotFound:
+                # A provider can report a transiently stale HEAD.  Fail closed
+                # instead of overwriting an object whose state is uncertain.
+                raise StorageError(f"Object disappeared while checking {key}")
+            if existing_digest != digest:
+                raise StorageConflict(f"Immutable object conflict at {key}")
+            return PutResult(key=key, existed=True, sha256=digest)
+        head_error = head.stderr.decode("utf-8", errors="replace").lower()
+        if not any(marker in head_error for marker in ("nosuchkey", "not found", "404")):
+            # A permission, endpoint, or transient provider failure must not be
+            # mistaken for absence and followed by an unsafe overwrite.
+            raise StorageError(f"Object metadata lookup failed for {key}")
 
-        target = f"s3://{self.bucket}/{full_key}"
-        command = ["s3", "cp", "-", target, *self._aws_args(), "--only-show-errors"]
+        # Use the S3 conditional create primitive so two workers racing on a
+        # new immutable key cannot overwrite one another.  A temporary file is
+        # used because ``put-object --body`` accepts a path consistently across
+        # AWS CLI and S3-compatible endpoints.
+        with tempfile.NamedTemporaryFile(prefix="solo-empire-upload-", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        command = [
+            "s3api", "put-object", "--bucket", self.bucket, "--key", full_key,
+            "--body", str(temporary), "--if-none-match", "*", *self._aws_args(),
+        ]
         if content_type:
             command.extend(["--content-type", content_type])
         command.extend(["--metadata", f"sha256={digest}"])
-        uploaded = self._run_aws(command, input_bytes=data)
+        try:
+            uploaded = self._run_aws(command)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
         if uploaded.returncode != 0:
+            error = uploaded.stderr.decode("utf-8", errors="replace").lower()
+            if any(marker in error for marker in ("precondition", "if-none-match", "412", "conditional")):
+                raise StorageConflict(f"Immutable object conflict at {key}")
             raise StorageError(
                 f"Object upload failed for {key}; AWS CLI exit={uploaded.returncode}"
             )
@@ -232,7 +301,7 @@ class ObjectStore:
             try:
                 return (self.root / key).read_bytes()
             except FileNotFoundError as exc:
-                raise StorageError(f"Object not found: {key}") from exc
+                raise ObjectNotFound(f"Object not found: {key}") from exc
 
         assert self.bucket is not None
         full_key = self._full_key(key)
@@ -241,12 +310,19 @@ class ObjectStore:
             *self._aws_args(), "--only-show-errors",
         ])
         if result.returncode != 0:
+            error = result.stderr.decode("utf-8", errors="replace").lower()
+            if any(marker in error for marker in ("nosuchkey", "not found", "404", "nosuchbucket")):
+                raise ObjectNotFound(f"Object not found: {key}")
             raise StorageError(f"Object download failed for {key}")
         return result.stdout
 
     def list_keys(self, prefix: str = "") -> list[str]:
         """List object keys below a prefix for bounded polling jobs."""
-        prefix = "/".join(part for part in prefix.strip("/").split("/") if part)
+        # Keep the local filesystem path bounded to ``self.root`` just like
+        # the S3 path is bounded by ``_full_key``.  A maintenance or polling
+        # caller may pass a user/configured prefix, so do not let ``..`` turn
+        # a read-only listing into a traversal outside the lake root.
+        prefix = _safe_key(prefix) if prefix.strip("/") else ""
         if self.scheme == "file":
             assert self.root is not None
             base = self.root / prefix

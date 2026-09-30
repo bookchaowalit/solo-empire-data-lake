@@ -102,7 +102,9 @@ class RuntimeTests(unittest.TestCase):
             "data_lake.product_adapter.load_query_runtime",
             return_value=(fake_query, RuntimeError, Path("/tmp/runtime")),
         ):
-            read_bronze_rows(contract, "job_postings", data_lake_uri="s3://bucket/prefix")
+            read_bronze_rows(
+                contract, "job_postings", data_lake_uri="s3://bucket/prefix", require_committed=False
+            )
         self.assertIn("ingest_date=*/source=*/part-*.parquet", str(captured["paths"]))
 
 
