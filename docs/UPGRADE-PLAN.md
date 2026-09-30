@@ -2,19 +2,19 @@
 
 ## Current state
 
-Score: 7/10 (was 5/10) — portable runtime now works without a parent Solo
-Empire checkout and matches the parent's `data_lake` surface used by the
-book-*-data product repos; Iceberg/S3 paths still lack offline tests.
+Score: 8/10 (was 7/10 after pass 1, 5/10 before) — portable runtime works
+without a parent checkout, drift against the parent is now machine-checked,
+and the Iceberg read path has offline tests; S3 write paths are still untested.
 
 ## Backlog
 
 - P1: Product repos (book-*-data) should add this package as a pinned `[lake]`
   extra and replace `find_solo_empire_root()`-based `skipUnless` guards with
   an import check, so lake tests run standalone.
-- P1: Add a parity check (script or CI job) that diffs `src/data_lake/*.py`
-  against the parent `infra/scripts/data_lake/*.py` to catch drift early.
-- P1: Offline tests for `read_iceberg_rows` using a mocked
-  `iceberg_table_location` (assert `metadata_location` is forwarded).
+- P1: Run `scripts/check_parity.py` in CI once the parent repo can be checked
+  out from this repo's workflow (needs a read token; today it is local-only).
+- P1: Offline tests for the S3 write path in `storage.py` (mock the AWS CLI
+  subprocess; assert no credentials reach argv/logs).
 - P2: `ingest.py` still tries `from _env import PROJECT_ROOT`; replace with an
   explicit env/arg so the packaged runtime has no hidden parent dependency.
 - P2: Add type checking (mypy/pyright) once public signatures settle.
@@ -31,3 +31,15 @@ book-*-data product repos; Iceberg/S3 paths still lack offline tests.
   readers do not guess the latest metadata file.
 - Added import-surface tests pinning every name the product repos use.
 - CI: Python 3.11 + 3.12 matrix, `ruff check`, read-only permissions.
+
+## Done in this pass (pass 2)
+
+- Added `scripts/check_parity.py`: AST-level drift check of `src/data_lake`
+  against `$SOLO_EMPIRE_ROOT/infra/scripts/data_lake` (ignores import style,
+  `sys.path` bootstrap, docstrings; reviewed divergences allow-listed with
+  reasons). Parent is in parity today (9 modules).
+- `tests/test_parity_check.py`: synthetic-tree tests for the checker plus a
+  live parent check when `SOLO_EMPIRE_ROOT` is set.
+- `tests/test_iceberg_read.py`: offline tests for `read_iceberg_rows`
+  (config guard, `metadata_location` forwarding, error mapping).
+- CI/README lint `scripts/` too; README documents the parity check.
