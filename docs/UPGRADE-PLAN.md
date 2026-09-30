@@ -15,6 +15,7 @@ and the Iceberg read path has offline tests; S3 write paths are still untested.
   out from this repo's workflow (needs a read token; today it is local-only).
 - P1: Offline tests for the S3 write path in `storage.py` (mock the AWS CLI
   subprocess; assert no credentials reach argv/logs).
+- P1: Bump the pinned lake SHA in book-*-data to pick up the pass-3 fixes.
 - P2: `ingest.py` still tries `from _env import PROJECT_ROOT`; replace with an
   explicit env/arg so the packaged runtime has no hidden parent dependency.
 - P2: Add type checking (mypy/pyright) once public signatures settle.
@@ -58,8 +59,10 @@ and the Iceberg read path has offline tests; S3 write paths are still untested.
 - `product_store.get_record_from_payload`: the product APIs already
   percent-decode the path, and this decoded again, so ids containing `%`
   were unreachable; it now tries the id as given before the decoded form.
-- The three functions are allow-listed in `scripts/check_parity.py`.
-  P1: port the same fixes to the parent `infra/scripts/data_lake` copy and
-  drop the allow-list entries; bump the pinned lake SHA in book-*-data.
+- The fixes were ported to the parent `infra/scripts/data_lake` copy (with
+  `infra/tests/data_lake/input_edge_cases_test.py`), and the three temporary
+  allow-list entries were removed from `scripts/check_parity.py`; live parity
+  against the parent passes again. Remaining: bump the pinned lake SHA in
+  book-*-data.
 - Verified: `tests/test_input_edge_cases.py` (7 of 8 fail on the old code);
   full suite with `PYTHONPATH=src` and live parity; ruff 0.15.8 + 0.16.9.
