@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -126,6 +125,7 @@ def iceberg_table_location(
         return {
             "table_identifier": table_identifier,
             "table_location": str(location),
+            "metadata_location": str(table.metadata_location),
         }
     finally:
         close = getattr(catalog, "close", None)
@@ -231,6 +231,11 @@ def register_bronze_file(
             "status": status,
             "table_identifier": table_identifier,
             "table_location": table_location,
+            # Readers must use the catalog-selected metadata file.  Scanning
+            # only the table directory makes DuckDB guess the highest numeric
+            # metadata version, which is unsafe after a catalog restore or a
+            # concurrent writer has left an older branch on disk.
+            "metadata_location": str(table.metadata_location),
             "data_file": file_location,
             "snapshot_id": snapshot.snapshot_id if snapshot else None,
         }

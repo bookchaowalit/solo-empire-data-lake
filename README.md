@@ -47,9 +47,29 @@ default Bronze API path.
 ## Verification
 
 ```bash
+ruff check src tests scripts
 python -m unittest discover -s tests -v
 python -m compileall -q src
 ```
+
+`tests/test_standalone_parity.py` pins the module surface that the
+`book-*-data` product repositories import (`product_adapter`,
+`product_store`, `silver`, `storage`) and runs it with no parent Solo Empire
+checkout on disk.
+
+### Parity with the parent monorepo
+
+The modules in `src/data_lake` are a portable copy of the parent Solo Empire
+`infra/scripts/data_lake` modules. Check for drift with:
+
+```bash
+SOLO_EMPIRE_ROOT=/path/to/solo-empire python scripts/check_parity.py
+```
+
+The check compares module ASTs, ignoring import style, `sys.path` bootstrap,
+and docstrings; reviewed divergences are listed in `ALLOWED_DIVERGENCE` in the
+script. Exit code 1 means drift, 2 means no parent checkout was found. With
+`SOLO_EMPIRE_ROOT` set, `tests/test_parity_check.py` also runs the live check.
 
 The package is intentionally small enough for a solo local machine while
 remaining installable by public product repositories and hosted containers.

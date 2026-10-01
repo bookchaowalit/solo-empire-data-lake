@@ -115,15 +115,24 @@ def _read_payload(input_name: str, format_name: str) -> tuple[bytes, list[Any], 
     suffix = Path(name).suffix.lower().lstrip(".")
     selected = format_name if format_name != "auto" else suffix
     if selected in {"ndjson", "jsonl"}:
-        records = [json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()]
+        # Split on CR/LF only: str.splitlines() also breaks on U+2028/U+2029/NEL,
+        # which JSON allows unescaped inside strings (raw CR/LF it does not).
+        # "utf-8-sig" drops a BOM that would make the first line invalid JSON.
+        records = [
+            json.loads(line)
+            for line in re.split(r"\r\n|\r|\n", raw.decode("utf-8-sig"))
+            if line.strip()
+        ]
         return raw, records, "jsonl"
     if selected == "json":
-        value = json.loads(raw.decode("utf-8"))
+        value = json.loads(raw.decode("utf-8-sig"))
         if isinstance(value, list):
             return raw, value, "json"
         return raw, [value], "json"
     if selected == "csv":
-        reader = csv.DictReader(io.StringIO(raw.decode("utf-8")))
+        # A BOM (Excel exports) would otherwise rename the first column to
+        # "\ufeffid" and silently drop every source_record_id.
+        reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""))
         return raw, list(reader), "csv"
     if selected in {"bin", "binary", ""}:
         return raw, [{"value": None}], "bin"

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,12 +91,6 @@ def default_data_lake_uri(
         return str((root / "data" / "lake").resolve())
     base = project_root or Path.cwd()
     return str((base / "data" / "lake").resolve())
-
-
-def _ensure_data_lake_on_path(solo_root: Path) -> None:
-    scripts = str(solo_root / "infra" / "scripts")
-    if scripts not in sys.path:
-        sys.path.insert(0, scripts)
 
 
 def load_ingest_runtime(start: Optional[Path] = None, *, solo_empire_root: str = ""):
@@ -271,14 +264,14 @@ def _committed_bronze_keys(
             raise LakeIngestError(f"Invalid Bronze commit manifest for {dataset}") from exc
         if not isinstance(manifest, dict):
             raise LakeIngestError(f"Invalid Bronze commit manifest shape for {dataset}")
-        for field, expected in {
+        for identity_field, expected in {
             "source": contract.source,
             "domain": contract.domain,
             "schema_version": contract.bronze_schema_version,
         }.items():
-            if manifest.get(field) != expected:
+            if manifest.get(identity_field) != expected:
                 raise LakeIngestError(
-                    f"Bronze commit manifest identity does not match {dataset}: {field}"
+                    f"Bronze commit manifest identity does not match {dataset}: {identity_field}"
                 )
         # A source commonly owns more than one dataset (for example prices
         # and history).  Ignore its valid manifests for the other datasets;
@@ -577,12 +570,11 @@ def select_latest_bronze_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, 
 
 
 def landing_object_bytes(data_lake_uri: str, raw_key: str) -> bytes:
-    """Replay exact landing bytes for a raw_object_key (offline proof)."""
-    ingest_payload, ParquetUnavailable, StorageError, solo_root = load_ingest_runtime()
-    del ingest_payload, ParquetUnavailable  # import side-effect only
-    _ensure_data_lake_on_path(solo_root)
-    from .storage import ObjectStore
+    """Replay exact landing bytes for a raw_object_key (offline proof).
 
+    The packaged runtime owns ``ObjectStore`` directly, so replay must not
+    depend on a parent Solo Empire checkout (standalone installs have none).
+    """
     try:
         return ObjectStore(data_lake_uri).get_bytes(raw_key)
     except StorageError as exc:
