@@ -71,5 +71,41 @@ and docstrings; reviewed divergences are listed in `ALLOWED_DIVERGENCE` in the
 script. Exit code 1 means drift, 2 means no parent checkout was found. With
 `SOLO_EMPIRE_ROOT` set, `tests/test_parity_check.py` also runs the live check.
 
+### Source ownership and updates
+
+For the nine shared modules currently in `src/data_lake` (including
+`__init__.py`), the parent `infra/scripts/data_lake` is the canonical source
+for shared algorithms and contracts. This repository owns the installable
+runtime, packaging, standalone tests, relative imports and the reviewed
+standalone adapters in `ALLOWED_DIVERGENCE`. Parent-only orchestration and
+pipeline modules are outside the package and this parity check's coverage.
+
+Use this reviewed update procedure:
+
+1. Change the shared algorithm in the parent and run its focused lake tests.
+2. Port that change to the matching package module, preserving the standalone
+   imports and adapters. Do not copy the parent directory wholesale. If a fix
+   starts in this package, port the shared behavior back to the parent before
+   treating the update as complete.
+3. From this package checkout, run the existing drift and standalone checks:
+
+   ```bash
+   python scripts/check_parity.py --parent /path/to/solo-empire
+   SOLO_EMPIRE_ROOT=/path/to/solo-empire PYTHONPATH=src \
+     python -m unittest discover -s tests -v
+   ruff check src tests scripts
+   python -m compileall -q src
+   ```
+
+4. Review and commit scoped changes separately in each repository. Record both
+   commits, then manually update consumers to the tested package commit or
+   release and run their contract tests. Never replace a pinned dependency
+   with `main`.
+
+There is no automatic synchronization or consumer-pin updater. The parity
+check reports differences; it does not copy code, verify bootstrap imports,
+publish a package or prove consumer compatibility. Add an allowed divergence
+only for a reviewed package boundary, with its reason and standalone tests.
+
 The package is intentionally small enough for a solo local machine while
 remaining installable by public product repositories and hosted containers.
